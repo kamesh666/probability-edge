@@ -1,0 +1,8 @@
+{
+  "name": "ProbabilityEdge F&O Engine",
+  "description": "Indian F&O algorithmic trading research, backtesting, and paper-trading platform for NIFTY 50 and BANKNIFTY index derivatives with market structure detection and risk controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

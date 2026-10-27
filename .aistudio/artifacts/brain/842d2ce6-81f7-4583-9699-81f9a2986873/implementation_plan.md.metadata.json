@@ -1,0 +1,6 @@
+{
+  "summary":  "Comprehensive architectural plan for ProbabilityEdge F&O Engine — an institutional-grade Indian derivatives research, backtesting, and paper-trading platform featuring multi-timeframe market structure detection, 5 specialized intraday option strategies, Black-Scholes Greeks, strict risk management, event-driven backtesting, and an interactive Bloomberg-style dark trading terminal.",
+  "updatedAt":  "2026-10-27T11:28:30.539683927Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
