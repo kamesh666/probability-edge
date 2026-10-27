@@ -6,7 +6,7 @@
 import React, { useState, useEffect } from 'react';
 import { RiskConfig } from '../../types/market.ts';
 import { AngelOneCredentials, parseAndValidateCSV, authenticateSmartApiWithBackend } from '../../data/marketDataService.ts';
-import { fetchAngelOneConfigFromCloudSql, saveAngelOneConfigToCloudSql } from '../../data/dbSyncService.ts';
+import { fetchAngelOneConfigFromCloudSql, saveAngelOneConfigToCloudSql, SavedAngelOneSecrets } from '../../data/dbSyncService.ts';
 import { Settings, Shield, UploadCloud, RefreshCw, Terminal, CheckCircle2, AlertTriangle, Key, Save, Database } from 'lucide-react';
 
 interface DiagnosticsSettingsViewProps {
@@ -14,8 +14,8 @@ interface DiagnosticsSettingsViewProps {
   onUpdateRiskConfig: (cfg: RiskConfig) => void;
   onImportCSVData: (csvText: string) => { success: boolean; message: string };
   onRegenerateSyntheticData: (days: number, seed: number) => void;
+  /** Signed-in Firebase uid; undefined when signed out. */
   userId?: string;
-  idToken?: string;
 }
 
 export const DiagnosticsSettingsView: React.FC<DiagnosticsSettingsViewProps> = ({
@@ -23,8 +23,7 @@ export const DiagnosticsSettingsView: React.FC<DiagnosticsSettingsViewProps> = (
   onUpdateRiskConfig,
   onImportCSVData,
   onRegenerateSyntheticData,
-  userId = 'default_trader',
-  idToken,
+  userId,
 }) => {
   // Risk Config local state
   const [localRisk, setLocalRisk] = useState<RiskConfig>({ ...riskConfig });
@@ -42,32 +41,50 @@ export const DiagnosticsSettingsView: React.FC<DiagnosticsSettingsViewProps> = (
   const [angelStatusMsg, setAngelStatusMsg] = useState<string>('Connected to Mock Market Feed');
   const [dbSaving, setDbSaving] = useState<boolean>(false);
   const [dbSaveSuccess, setDbSaveSuccess] = useState<string>('');
+  // Which secrets are already stored on the server (their values are never sent back)
+  const [savedSecrets, setSavedSecrets] = useState<SavedAngelOneSecrets>({ apiKey: false, mpin: false, totpSecret: false });
 
   // Load saved Angel One credentials from Cloud SQL on mount
   useEffect(() => {
     let mounted = true;
-    fetchAngelOneConfigFromCloudSql(userId, idToken).then(res => {
+    if (!userId) {
+      setSavedSecrets({ apiKey: false, mpin: false, totpSecret: false });
+      return;
+    }
+    fetchAngelOneConfigFromCloudSql().then(res => {
       if (mounted && res.success && res.config) {
         setAngelCreds(prev => ({
           ...prev,
           ...res.config,
         }));
-        if (res.config.apiKey && res.config.clientCode) {
-          setAngelStatusMsg(`Loaded credentials for ${res.config.clientCode} from Cloud SQL`);
+        if (res.saved) setSavedSecrets(res.saved);
+        if (res.saved?.apiKey && res.config.clientCode) {
+          setAngelStatusMsg(`Saved credentials found for ${res.config.clientCode}`);
         }
       }
     });
     return () => {
       mounted = false;
     };
-  }, [userId, idToken]);
+  }, [userId]);
 
   const handleSaveAngelDetails = async () => {
+    if (!userId) {
+      setDbSaveSuccess('Sign in to save credentials');
+      return;
+    }
     setDbSaving(true);
     setDbSaveSuccess('');
-    const res = await saveAngelOneConfigToCloudSql(angelCreds, userId, idToken);
+    const res = await saveAngelOneConfigToCloudSql(angelCreds);
     setDbSaving(false);
     if (res.success) {
+      setSavedSecrets(prev => ({
+        apiKey: prev.apiKey || Boolean(angelCreds.apiKey),
+        mpin: prev.mpin || Boolean(angelCreds.mpin),
+        totpSecret: prev.totpSecret || Boolean(angelCreds.totpSecret),
+      }));
+      // Clear typed secrets from memory once they are stored server-side
+      setAngelCreds(prev => ({ ...prev, apiKey: '', mpin: '', totpSecret: '' }));
       setDbSaveSuccess('Saved to Cloud SQL');
       setTimeout(() => setDbSaveSuccess(''), 3000);
     } else {
@@ -97,7 +114,9 @@ export const DiagnosticsSettingsView: React.FC<DiagnosticsSettingsViewProps> = (
       return;
     }
 
-    if (!angelCreds.apiKey || !angelCreds.clientCode || !angelCreds.mpin) {
+    const hasApiKey = Boolean(angelCreds.apiKey) || savedSecrets.apiKey;
+    const hasMpin = Boolean(angelCreds.mpin) || savedSecrets.mpin;
+    if (!hasApiKey || !angelCreds.clientCode || !hasMpin) {
       setAngelStatusMsg('Error: API Key, Client Code, and MPIN are required for Live SmartAPI session.');
       setAngelCreds(prev => ({ ...prev, isConnected: false }));
       return;
@@ -109,8 +128,6 @@ export const DiagnosticsSettingsView: React.FC<DiagnosticsSettingsViewProps> = (
       setAngelCreds(prev => ({
         ...prev,
         isConnected: true,
-        jwtToken: result.jwtToken,
-        feedToken: result.feedToken,
         lastConnectedAt: new Date().toLocaleTimeString(),
       }));
       setAngelStatusMsg(result.message);
@@ -169,7 +186,7 @@ export const DiagnosticsSettingsView: React.FC<DiagnosticsSettingsViewProps> = (
               <label className="text-slate-400 block mb-1">API Key</label>
               <input
                 type="password"
-                placeholder={angelCreds.isMockMode ? 'MOCK_FEED_ENABLED' : 'Enter SmartAPI Key'}
+                placeholder={angelCreds.isMockMode ? 'MOCK_FEED_ENABLED' : savedSecrets.apiKey ? 'Saved (leave blank to keep)' : 'Enter SmartAPI Key'}
                 disabled={angelCreds.isMockMode}
                 value={angelCreds.apiKey}
                 onChange={e => setAngelCreds({ ...angelCreds, apiKey: e.target.value })}
@@ -194,7 +211,7 @@ export const DiagnosticsSettingsView: React.FC<DiagnosticsSettingsViewProps> = (
                 <label className="text-slate-400 block mb-1">MPIN</label>
                 <input
                   type="password"
-                  placeholder="••••"
+                  placeholder={savedSecrets.mpin ? 'Saved' : '••••'}
                   disabled={angelCreds.isMockMode}
                   value={angelCreds.mpin}
                   onChange={e => setAngelCreds({ ...angelCreds, mpin: e.target.value })}
@@ -207,7 +224,7 @@ export const DiagnosticsSettingsView: React.FC<DiagnosticsSettingsViewProps> = (
               <label className="text-slate-400 block mb-1">TOTP 2FA Secret Key</label>
               <input
                 type="password"
-                placeholder="Authenticator TOTP Secret Key (Base32)"
+                placeholder={savedSecrets.totpSecret ? 'Saved (leave blank to keep)' : 'Authenticator TOTP Secret Key (Base32)'}
                 disabled={angelCreds.isMockMode}
                 value={angelCreds.totpSecret || ''}
                 onChange={e => setAngelCreds({ ...angelCreds, totpSecret: e.target.value })}

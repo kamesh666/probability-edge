@@ -5,31 +5,36 @@
 
 import { TradeRecord } from '../types/market.ts';
 import { AngelOneCredentials } from './marketDataService.ts';
+import { auth } from '../lib/firebase.ts';
 
 const API_BASE = '/api';
 
-function getAuthHeaders(idToken?: string, userId?: string): Record<string, string> {
-  const headers: Record<string, string> = {
+const NOT_SIGNED_IN = 'Not signed in';
+
+/**
+ * Builds request headers with a fresh Firebase ID token for the signed-in user.
+ * Returns null when nobody is signed in. getIdToken() refreshes expired tokens.
+ */
+async function getAuthHeaders(): Promise<Record<string, string> | null> {
+  const user = auth.currentUser;
+  if (!user) return null;
+  const idToken = await user.getIdToken();
+  return {
     'Content-Type': 'application/json',
+    Authorization: `Bearer ${idToken}`,
   };
-  if (idToken) {
-    headers['Authorization'] = `Bearer ${idToken}`;
-  }
-  if (userId) {
-    headers['x-user-id'] = userId;
-  }
-  return headers;
 }
 
 /**
  * Persist a completed paper/simulated trade to Cloud SQL.
  */
 export async function syncTradeToCloudSql(
-  trade: TradeRecord,
-  userId = 'default_trader',
-  idToken?: string
+  trade: TradeRecord
 ): Promise<{ success: boolean; data?: any; error?: string }> {
   try {
+    const headers = await getAuthHeaders();
+    if (!headers) return { success: false, error: NOT_SIGNED_IN };
+
     const payload = {
       tradeId: trade.id,
       symbol: trade.symbol,
@@ -56,7 +61,7 @@ export async function syncTradeToCloudSql(
 
     const res = await fetch(`${API_BASE}/trades`, {
       method: 'POST',
-      headers: getAuthHeaders(idToken, userId),
+      headers,
       body: JSON.stringify(payload),
     });
 
@@ -76,13 +81,13 @@ export async function syncTradeToCloudSql(
 /**
  * Fetch daily trades from Cloud SQL for the user.
  */
-export async function fetchTradesFromCloudSql(
-  userId = 'default_trader',
-  idToken?: string
-): Promise<{ success: boolean; trades?: TradeRecord[]; error?: string }> {
+export async function fetchTradesFromCloudSql(): Promise<{ success: boolean; trades?: TradeRecord[]; error?: string }> {
   try {
-    const res = await fetch(`${API_BASE}/trades?userId=${encodeURIComponent(userId)}`, {
-      headers: getAuthHeaders(idToken, userId),
+    const headers = await getAuthHeaders();
+    if (!headers) return { success: false, error: NOT_SIGNED_IN };
+
+    const res = await fetch(`${API_BASE}/trades`, {
+      headers,
     });
 
     if (!res.ok) {
@@ -128,14 +133,15 @@ export async function fetchTradesFromCloudSql(
  */
 export async function updateTradeNotesInCloudSql(
   tradeId: string,
-  notes: string,
-  userId = 'default_trader',
-  idToken?: string
+  notes: string
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    const headers = await getAuthHeaders();
+    if (!headers) return { success: false, error: NOT_SIGNED_IN };
+
     const res = await fetch(`${API_BASE}/trades/${encodeURIComponent(tradeId)}/notes`, {
       method: 'PATCH',
-      headers: getAuthHeaders(idToken, userId),
+      headers,
       body: JSON.stringify({ notes }),
     });
 
@@ -152,21 +158,22 @@ export async function updateTradeNotesInCloudSql(
  * Persist Angel One configuration to Cloud SQL.
  */
 export async function saveAngelOneConfigToCloudSql(
-  creds: AngelOneCredentials,
-  userId = 'default_trader',
-  idToken?: string
+  creds: AngelOneCredentials
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    const headers = await getAuthHeaders();
+    if (!headers) return { success: false, error: NOT_SIGNED_IN };
+
     const res = await fetch(`${API_BASE}/angel-one`, {
       method: 'POST',
-      headers: getAuthHeaders(idToken, userId),
+      headers,
+      // Blank secret fields are left out so the server keeps the saved value.
       body: JSON.stringify({
-        apiKey: creds.apiKey,
+        apiKey: creds.apiKey || undefined,
         clientCode: creds.clientCode,
-        mpin: creds.mpin,
-        totpSecret: creds.totpSecret,
+        mpin: creds.mpin || undefined,
+        totpSecret: creds.totpSecret || undefined,
         isMockMode: creds.isMockMode,
-        lastConnectedAt: creds.isConnected ? new Date().toISOString() : null,
       }),
     });
 
@@ -179,16 +186,27 @@ export async function saveAngelOneConfigToCloudSql(
   }
 }
 
+export interface SavedAngelOneSecrets {
+  apiKey: boolean;
+  mpin: boolean;
+  totpSecret: boolean;
+}
+
 /**
  * Load saved Angel One configuration from Cloud SQL.
  */
-export async function fetchAngelOneConfigFromCloudSql(
-  userId = 'default_trader',
-  idToken?: string
-): Promise<{ success: boolean; config?: Partial<AngelOneCredentials>; error?: string }> {
+export async function fetchAngelOneConfigFromCloudSql(): Promise<{
+  success: boolean;
+  config?: Partial<AngelOneCredentials>;
+  saved?: SavedAngelOneSecrets;
+  error?: string;
+}> {
   try {
-    const res = await fetch(`${API_BASE}/angel-one?userId=${encodeURIComponent(userId)}`, {
-      headers: getAuthHeaders(idToken, userId),
+    const headers = await getAuthHeaders();
+    if (!headers) return { success: false, error: NOT_SIGNED_IN };
+
+    const res = await fetch(`${API_BASE}/angel-one`, {
+      headers,
     });
 
     if (!res.ok) {
@@ -198,16 +216,22 @@ export async function fetchAngelOneConfigFromCloudSql(
     const data = await res.json();
     if (!data) return { success: true };
 
+    // The server never returns secrets, only whether each one is saved.
     return {
       success: true,
       config: {
-        apiKey: data.apiKey || '',
+        apiKey: '',
         clientCode: data.clientCode || '',
-        mpin: data.mpin || '',
-        totpSecret: data.totpSecret || '',
+        mpin: '',
+        totpSecret: '',
         isMockMode: data.isMockMode ?? true,
-        isConnected: Boolean(data.apiKey && data.clientCode),
+        isConnected: Boolean(data.hasActiveSession),
         lastConnectedAt: data.lastConnectedAt ? new Date(data.lastConnectedAt).toLocaleTimeString() : undefined,
+      },
+      saved: {
+        apiKey: Boolean(data.hasApiKey),
+        mpin: Boolean(data.hasMpin),
+        totpSecret: Boolean(data.hasTotpSecret),
       },
     };
   } catch (err: any) {

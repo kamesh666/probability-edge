@@ -4,6 +4,7 @@
  */
 
 import { Candle, Instrument, Timeframe, LiveMarketQuote } from '../types/market.ts';
+import { auth } from '../lib/firebase.ts';
 
 export interface AngelOneCredentials {
   apiKey: string;
@@ -269,15 +270,24 @@ export async function fetchMarketSessionStatus(): Promise<{
 export async function authenticateSmartApiWithBackend(creds: Partial<AngelOneCredentials>): Promise<{
   success: boolean;
   message: string;
-  jwtToken?: string;
-  feedToken?: string;
   sessionTime?: string;
 }> {
   try {
+    const user = auth.currentUser;
+    if (!user) {
+      return { success: false, message: 'Sign in to connect your Angel One account.' };
+    }
+    const idToken = await user.getIdToken();
+    // Blank fields are filled in by the server from the saved credentials.
     const res = await fetch('/api/angel-one/authenticate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(creds),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+      body: JSON.stringify({
+        apiKey: creds.apiKey || undefined,
+        clientCode: creds.clientCode || undefined,
+        mpin: creds.mpin || undefined,
+        totpSecret: creds.totpSecret || undefined,
+      }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
