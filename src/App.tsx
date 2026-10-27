@@ -68,7 +68,7 @@ export default function App() {
           const token = await user.getIdToken();
           setIdToken(token);
           showNotification(`Signed in as ${user.email} · Cloud SQL active`, 'success');
-          const res = await fetchTradesFromCloudSql(user.uid, token);
+          const res = await fetchTradesFromCloudSql();
           if (res.success && res.trades && res.trades.length > 0) {
             paperBroker.mergeHistoricalTrades(res.trades);
             setTrades([...paperBroker.getTradeHistory()]);
@@ -77,13 +77,8 @@ export default function App() {
           console.error('Error fetching user token or trades:', e);
         }
       } else {
+        // Signed out: trades stay in this browser only; cloud sync needs sign-in.
         setIdToken(undefined);
-        fetchTradesFromCloudSql('default_trader').then((res) => {
-          if (res.success && res.trades && res.trades.length > 0) {
-            paperBroker.mergeHistoricalTrades(res.trades);
-            setTrades([...paperBroker.getTradeHistory()]);
-          }
-        });
       }
     });
     return () => unsubscribe();
@@ -96,8 +91,8 @@ export default function App() {
       setAccountState({ ...paperBroker.getAccountState() });
       setPositions([...paperBroker.getPositions()]);
 
-      const uid = currentUser?.uid || 'default_trader';
-      const res = await syncTradeToCloudSql(closedTrade, uid, idToken);
+      if (!currentUser) return;
+      const res = await syncTradeToCloudSql(closedTrade);
       if (res.success) {
         showNotification(`Trade ${closedTrade.symbol} persisted to Cloud SQL`, 'success');
       }
@@ -564,9 +559,16 @@ export default function App() {
               const tr = trades.find(t => t.id === tId);
               if (tr) tr.userNotes = notes;
               setTrades([...trades]);
-              const uid = currentUser?.uid || 'default_trader';
-              await updateTradeNotesInCloudSql(tId, notes, uid, idToken);
-              showNotification('Journal note updated in Cloud SQL', 'success');
+              if (!currentUser) {
+                showNotification('Note saved in this browser. Sign in to sync it to Cloud SQL.', 'info');
+                return;
+              }
+              const res = await updateTradeNotesInCloudSql(tId, notes);
+              if (res.success) {
+                showNotification('Journal note updated in Cloud SQL', 'success');
+              } else {
+                showNotification(`Could not sync note: ${res.error}`, 'warn');
+              }
             }}
           />
         )}
@@ -580,8 +582,7 @@ export default function App() {
             }}
             onImportCSVData={handleImportCSVData}
             onRegenerateSyntheticData={handleRegenerateSynthetic}
-            userId={currentUser?.uid || 'default_trader'}
-            idToken={idToken}
+            userId={currentUser?.uid}
           />
         )}
       </main>

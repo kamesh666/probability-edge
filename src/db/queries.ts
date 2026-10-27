@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { eq, desc } from 'drizzle-orm';
+import { and, eq, desc } from 'drizzle-orm';
 import { db } from './index.ts';
 import { users, tradeRecords, angelOneConfigs } from './schema.ts';
 
@@ -127,14 +127,15 @@ export async function getTradeRecordsByUser(userId: string, limit = 200) {
 }
 
 /**
- * Updates journal notes for a specific trade.
+ * Updates journal notes for a trade owned by the given user.
+ * Returns null when no trade with that id belongs to the user.
  */
 export async function updateTradeRecordNotes(userId: string, tradeId: string, notes: string) {
   try {
     const updated = await db
       .update(tradeRecords)
       .set({ userNotes: notes })
-      .where(eq(tradeRecords.tradeId, tradeId))
+      .where(and(eq(tradeRecords.userId, userId), eq(tradeRecords.tradeId, tradeId)))
       .returning();
     return updated[0] || null;
   } catch (error) {
@@ -144,42 +145,70 @@ export async function updateTradeRecordNotes(userId: string, tradeId: string, no
 }
 
 /**
+ * Safe view of a stored Angel One config: secrets are never included,
+ * only whether each one has been saved.
+ */
+export interface AngelOneConfigSummary {
+  clientCode: string | null;
+  isMockMode: boolean;
+  lastConnectedAt: Date | null;
+  updatedAt: Date | null;
+  hasApiKey: boolean;
+  hasMpin: boolean;
+  hasTotpSecret: boolean;
+  hasActiveSession: boolean;
+}
+
+export function toAngelOneConfigSummary(
+  row: typeof angelOneConfigs.$inferSelect | null | undefined
+): AngelOneConfigSummary | null {
+  if (!row) return null;
+  return {
+    clientCode: row.clientCode,
+    isMockMode: row.isMockMode ?? true,
+    lastConnectedAt: row.lastConnectedAt,
+    updatedAt: row.updatedAt,
+    hasApiKey: Boolean(row.apiKey),
+    hasMpin: Boolean(row.mpin),
+    hasTotpSecret: Boolean(row.totpSecret),
+    hasActiveSession: Boolean(row.jwtToken),
+  };
+}
+
+/**
  * Upserts Angel One SmartAPI configuration for a user.
+ * Only fields that are present in `config` are written, so a blank secret
+ * field in the settings form does not erase a secret saved earlier.
+ * Pass an empty string to clear a secret explicitly.
  */
 export async function upsertAngelOneConfig(userId: string, config: AngelOneConfigInput) {
   try {
-    const lastConn = config.lastConnectedAt
-      ? config.lastConnectedAt instanceof Date
-        ? config.lastConnectedAt
-        : new Date(config.lastConnectedAt)
-      : null;
+    const fields: Partial<typeof angelOneConfigs.$inferInsert> = {};
+    const setText = (key: 'apiKey' | 'clientCode' | 'mpin' | 'totpSecret' | 'feedToken' | 'jwtToken') => {
+      const value = config[key];
+      if (typeof value === 'string') fields[key] = value.trim() === '' ? null : value.trim();
+    };
+    setText('apiKey');
+    setText('clientCode');
+    setText('mpin');
+    setText('totpSecret');
+    setText('feedToken');
+    setText('jwtToken');
+    if (typeof config.isMockMode === 'boolean') fields.isMockMode = config.isMockMode;
+    if (config.lastConnectedAt !== undefined) {
+      fields.lastConnectedAt = config.lastConnectedAt
+        ? config.lastConnectedAt instanceof Date
+          ? config.lastConnectedAt
+          : new Date(config.lastConnectedAt)
+        : null;
+    }
 
     const result = await db
       .insert(angelOneConfigs)
-      .values({
-        userId,
-        apiKey: config.apiKey ?? null,
-        clientCode: config.clientCode ?? null,
-        mpin: config.mpin ?? null,
-        totpSecret: config.totpSecret ?? null,
-        feedToken: config.feedToken ?? null,
-        jwtToken: config.jwtToken ?? null,
-        isMockMode: config.isMockMode ?? true,
-        lastConnectedAt: lastConn,
-      })
+      .values({ userId, ...fields })
       .onConflictDoUpdate({
         target: angelOneConfigs.userId,
-        set: {
-          apiKey: config.apiKey ?? null,
-          clientCode: config.clientCode ?? null,
-          mpin: config.mpin ?? null,
-          totpSecret: config.totpSecret ?? null,
-          feedToken: config.feedToken ?? null,
-          jwtToken: config.jwtToken ?? null,
-          isMockMode: config.isMockMode ?? true,
-          lastConnectedAt: lastConn,
-          updatedAt: new Date(),
-        },
+        set: { ...fields, updatedAt: new Date() },
       })
       .returning();
 
@@ -191,7 +220,8 @@ export async function upsertAngelOneConfig(userId: string, config: AngelOneConfi
 }
 
 /**
- * Retrieves Angel One SmartAPI configuration for a user.
+ * Retrieves the full Angel One SmartAPI configuration (including secrets) for a user.
+ * Server-side use only: never send this row to the client.
  */
 export async function getAngelOneConfigByUser(userId: string) {
   try {

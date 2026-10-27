@@ -7,7 +7,7 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { optionalAuth, AuthRequest } from './src/middleware/auth.ts';
+import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
 import {
   insertTradeRecord,
   getTradeRecordsByUser,
@@ -15,6 +15,7 @@ import {
   upsertAngelOneConfig,
   getAngelOneConfigByUser,
   getOrCreateUser,
+  toAngelOneConfigSummary,
 } from './src/db/queries.ts';
 
 import {
@@ -26,6 +27,17 @@ import {
 import { Instrument } from './src/types/market.ts';
 
 dotenv.config();
+
+// Make sure a users row exists for the signed-in user. Failure here should not block the request.
+async function syncUserProfile(req: AuthRequest) {
+  const user = req.user;
+  if (!user) return;
+  try {
+    await getOrCreateUser(user.uid, user.email || `${user.uid}@users.probabilityedge.local`);
+  } catch (err) {
+    console.warn('Could not sync user profile:', err);
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -96,23 +108,46 @@ async function startServer() {
     }
   });
 
-  // Angel One SmartAPI: Authenticate & Generate Session
-  app.post('/api/angel-one/authenticate', async (req: Request, res: Response) => {
+  // Angel One SmartAPI: Authenticate & Generate Session.
+  // Any field left blank falls back to the credential saved for this user.
+  // Session tokens are stored server-side and never returned to the browser.
+  app.post('/api/angel-one/authenticate', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
-      const { apiKey, clientCode, mpin, totpSecret } = req.body || {};
-      const result = await authenticateAngelOne({ apiKey, clientCode, mpin, totpSecret });
-      res.json(result);
+      const userId = req.user!.uid;
+      const body = req.body || {};
+      const pick = (v: unknown) => (typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined);
+      const stored = await getAngelOneConfigByUser(userId);
+
+      const result = await authenticateAngelOne({
+        apiKey: pick(body.apiKey) ?? stored?.apiKey ?? '',
+        clientCode: pick(body.clientCode) ?? stored?.clientCode ?? '',
+        mpin: pick(body.mpin) ?? stored?.mpin ?? '',
+        totpSecret: pick(body.totpSecret) ?? stored?.totpSecret ?? undefined,
+      });
+
+      if (result.success && stored) {
+        await upsertAngelOneConfig(userId, {
+          jwtToken: result.jwtToken,
+          feedToken: result.feedToken,
+          lastConnectedAt: result.sessionTime ?? new Date(),
+        });
+      }
+
+      res.json({
+        success: result.success,
+        message: result.message,
+        sessionTime: result.sessionTime,
+      });
     } catch (err: any) {
       console.error('API /api/angel-one/authenticate error:', err);
       res.status(500).json({ success: false, message: 'Authentication handshake failed' });
     }
   });
 
-  // Trades: Get trade records for user
-  app.get('/api/trades', optionalAuth, async (req: AuthRequest, res: Response) => {
+  // Trades: Get trade records for the signed-in user
+  app.get('/api/trades', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
-      const userId = req.user?.uid || 'default_trader';
-      const records = await getTradeRecordsByUser(userId);
+      const records = await getTradeRecordsByUser(req.user!.uid);
       res.json(records);
     } catch (err: any) {
       console.error('API /api/trades GET error:', err);
@@ -120,19 +155,11 @@ async function startServer() {
     }
   });
 
-  // Trades: Insert new trade record
-  app.post('/api/trades', optionalAuth, async (req: AuthRequest, res: Response) => {
+  // Trades: Insert new trade record for the signed-in user
+  app.post('/api/trades', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
-      const userId = req.user?.uid || 'default_trader';
-      const userEmail = (req.user as any)?.email || 'trader@probabilityedge.local';
-
-      // Ensure user entry exists
-      try {
-        await getOrCreateUser(userId, userEmail);
-      } catch (uErr) {
-        // Non-blocking for trade recording
-        console.warn('Could not sync user profile:', uErr);
-      }
+      const userId = req.user!.uid;
+      await syncUserProfile(req);
 
       const input = req.body;
       if (!input || !input.tradeId || !input.symbol) {
@@ -147,14 +174,18 @@ async function startServer() {
     }
   });
 
-  // Trades: Update journal note for a trade
-  app.patch('/api/trades/:id/notes', optionalAuth, async (req: AuthRequest, res: Response) => {
+  // Trades: Update journal note on a trade the signed-in user owns
+  app.patch('/api/trades/:id/notes', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
-      const userId = req.user?.uid || 'default_trader';
-      const tradeId = req.params.id;
-      const { notes } = req.body;
+      const notes = req.body?.notes;
+      if (notes != null && typeof notes !== 'string') {
+        return res.status(400).json({ error: 'Notes must be a string' });
+      }
 
-      const updated = await updateTradeRecordNotes(userId, tradeId, notes ?? '');
+      const updated = await updateTradeRecordNotes(req.user!.uid, req.params.id, notes ?? '');
+      if (!updated) {
+        return res.status(404).json({ error: 'Trade not found' });
+      }
       res.json({ success: true, trade: updated });
     } catch (err: any) {
       console.error('API /api/trades/:id/notes PATCH error:', err);
@@ -162,33 +193,34 @@ async function startServer() {
     }
   });
 
-  // Angel One: Get credentials & settings
-  app.get('/api/angel-one', optionalAuth, async (req: AuthRequest, res: Response) => {
+  // Angel One: Get saved settings (secrets are reported as saved/not saved, never returned)
+  app.get('/api/angel-one', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
-      const userId = req.user?.uid || 'default_trader';
-      const config = await getAngelOneConfigByUser(userId);
-      res.json(config || null);
+      const config = await getAngelOneConfigByUser(req.user!.uid);
+      res.json(toAngelOneConfigSummary(config));
     } catch (err: any) {
       console.error('API /api/angel-one GET error:', err);
       res.status(500).json({ error: 'Failed to retrieve Angel One configuration' });
     }
   });
 
-  // Angel One: Save or update credentials & settings
-  app.post('/api/angel-one', optionalAuth, async (req: AuthRequest, res: Response) => {
+  // Angel One: Save or update credentials & settings.
+  // Session tokens are server-managed and cannot be set from the client.
+  app.post('/api/angel-one', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
-      const userId = req.user?.uid || 'default_trader';
-      const userEmail = (req.user as any)?.email || 'trader@probabilityedge.local';
+      const userId = req.user!.uid;
+      await syncUserProfile(req);
 
-      try {
-        await getOrCreateUser(userId, userEmail);
-      } catch (uErr) {
-        console.warn('Could not sync user profile:', uErr);
-      }
-
-      const config = req.body;
-      const saved = await upsertAngelOneConfig(userId, config);
-      res.json({ success: true, config: saved });
+      const body = req.body || {};
+      const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
+      const saved = await upsertAngelOneConfig(userId, {
+        apiKey: str(body.apiKey),
+        clientCode: str(body.clientCode),
+        mpin: str(body.mpin),
+        totpSecret: str(body.totpSecret),
+        isMockMode: typeof body.isMockMode === 'boolean' ? body.isMockMode : undefined,
+      });
+      res.json({ success: true, config: toAngelOneConfigSummary(saved) });
     } catch (err: any) {
       console.error('API /api/angel-one POST error:', err);
       res.status(500).json({ error: 'Failed to save Angel One configuration' });

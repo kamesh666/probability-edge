@@ -8,11 +8,13 @@ import { adminAuth } from '../lib/firebase-admin.ts';
 import { DecodedIdToken } from 'firebase-admin/auth';
 
 export interface AuthRequest extends Request {
-  user?: DecodedIdToken | { uid: string; email?: string };
+  user?: DecodedIdToken;
 }
 
 /**
- * Strict authentication middleware requiring a verified Firebase ID token.
+ * Requires a verified Firebase ID token in the Authorization header.
+ * The user identity comes only from the verified token, never from
+ * client-supplied headers or query parameters.
  */
 export const requireAuth = async (
   req: AuthRequest,
@@ -24,41 +26,12 @@ export const requireAuth = async (
     return res.status(401).json({ error: 'Unauthorized: Missing or invalid token' });
   }
 
-  const token = authHeader.split('Bearer ')[1];
+  const token = authHeader.slice('Bearer '.length).trim();
   try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
-    req.user = decodedToken;
+    req.user = await adminAuth.verifyIdToken(token);
     next();
   } catch (error) {
-    console.error('Error verifying Firebase ID token:', error);
+    console.warn('Firebase ID token verification failed:', (error as Error)?.message);
     return res.status(401).json({ error: 'Unauthorized: Invalid token' });
   }
-};
-
-/**
- * Optional authentication middleware:
- * If a valid Bearer token is provided, decodes and attaches the user.
- * If not, falls back to a provided userId query/header or default 'trader-session'.
- */
-export const optionalAuth = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.split('Bearer ')[1];
-    try {
-      const decodedToken = await adminAuth.verifyIdToken(token);
-      req.user = decodedToken;
-      return next();
-    } catch (error) {
-      console.warn('Bearer token verification failed in optionalAuth:', error);
-    }
-  }
-
-  // Fallback to client header or default session
-  const clientUid = (req.headers['x-user-id'] as string) || (req.query.userId as string) || 'default_trader';
-  req.user = { uid: clientUid, email: 'trader@probabilityedge.local' };
-  next();
 };
